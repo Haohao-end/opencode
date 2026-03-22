@@ -159,26 +159,31 @@ export namespace SessionPrompt {
   })
   export type PromptInput = z.infer<typeof PromptInput>
 
-  export const prompt = fn(PromptInput, async (input) => {
-    const session = await Session.get(input.sessionID)
-    await SessionRevert.cleanup(session)
-
-    const message = await createUserMessage(input)
-    await Session.touch(input.sessionID)
-
-    // this is backwards compatibility for allowing `tools` to be specified when
-    // prompting
+  function promptToolPermissions(tools?: Record<string, boolean>): Permission.Ruleset {
     const permissions: Permission.Ruleset = []
-    for (const [tool, enabled] of Object.entries(input.tools ?? {})) {
+    for (const [tool, enabled] of Object.entries(tools ?? {})) {
       permissions.push({
         permission: tool,
         action: enabled ? "allow" : "deny",
         pattern: "*",
       })
     }
-    if (permissions.length > 0) {
-      session.permission = permissions
-      await Session.setPermission({ sessionID: session.id, permission: permissions })
+    return permissions
+  }
+
+  export const prompt = fn(PromptInput, async (input) => {
+    const session = await Session.get(input.sessionID)
+    await SessionRevert.cleanup(session)
+    const toolPermissions = promptToolPermissions(input.tools)
+
+    const message = await createUserMessage(input, session, toolPermissions)
+    await Session.touch(input.sessionID)
+
+    // this is backwards compatibility for allowing `tools` to be specified when
+    // prompting
+    if (toolPermissions.length > 0) {
+      session.permission = toolPermissions
+      await Session.setPermission({ sessionID: session.id, permission: toolPermissions })
     }
 
     if (input.noReply === true) {
@@ -963,7 +968,11 @@ export namespace SessionPrompt {
     })
   }
 
-  async function createUserMessage(input: PromptInput) {
+  async function createUserMessage(
+    input: PromptInput,
+    session: Awaited<ReturnType<typeof Session.get>>,
+    toolPermissions: Permission.Ruleset,
+  ) {
     const agent = await Agent.get(input.agent ?? (await Agent.defaultAgent()))
 
     const model = input.model ?? agent.model ?? (await lastModel(input.sessionID))
@@ -994,6 +1003,64 @@ export namespace SessionPrompt {
       ...part,
       id: part.id ? PartID.make(part.id) : PartID.ascending(),
     })
+    const effectivePermissions = toolPermissions.length > 0 ? toolPermissions : (session.permission ?? [])
+    const executeSyntheticReadTool = async (args: Tool.InferParameters<typeof ReadTool>) => {
+      const callID = PartID.ascending()
+      const model = await Provider.getModel(info.model.providerID, info.model.modelID)
+      const readCtx: Tool.Context = {
+        sessionID: input.sessionID,
+        abort: new AbortController().signal,
+        agent: agent.name,
+        messageID: info.id,
+        callID,
+        extra: { bypassCwdCheck: true, model },
+        messages: [],
+        metadata: async () => {},
+        async ask(req) {
+          await Permission.ask({
+            ...req,
+            sessionID: input.sessionID,
+            tool: { messageID: info.id, callID },
+            ruleset: Permission.merge(agent.permission, effectivePermissions),
+          })
+        },
+      }
+      const payload = { args }
+
+      await Plugin.trigger(
+        "tool.execute.before",
+        {
+          tool: ReadTool.id,
+          sessionID: readCtx.sessionID,
+          callID,
+        },
+        payload,
+      )
+
+      const result = await ReadTool.init().then((tool) => tool.execute(payload.args, readCtx))
+      const output = {
+        ...result,
+        attachments: result.attachments?.map((attachment) => ({
+          ...attachment,
+          id: PartID.ascending(),
+          sessionID: readCtx.sessionID,
+          messageID: info.id,
+        })),
+      }
+
+      await Plugin.trigger(
+        "tool.execute.after",
+        {
+          tool: ReadTool.id,
+          sessionID: readCtx.sessionID,
+          callID,
+          args: payload.args,
+        },
+        output,
+      )
+
+      return output
+    }
 
     const parts = await Promise.all(
       input.parts.map(async (part): Promise<Draft<MessageV2.Part>[]> => {
@@ -1150,20 +1217,8 @@ export namespace SessionPrompt {
                   },
                 ]
 
-                await ReadTool.init()
-                  .then(async (t) => {
-                    const model = await Provider.getModel(info.model.providerID, info.model.modelID)
-                    const readCtx: Tool.Context = {
-                      sessionID: input.sessionID,
-                      abort: new AbortController().signal,
-                      agent: input.agent!,
-                      messageID: info.id,
-                      extra: { bypassCwdCheck: true, model },
-                      messages: [],
-                      metadata: async () => {},
-                      ask: async () => {},
-                    }
-                    const result = await t.execute(args, readCtx)
+                await executeSyntheticReadTool(args)
+                  .then(async (result) => {
                     pieces.push({
                       messageID: info.id,
                       sessionID: input.sessionID,
@@ -1212,17 +1267,7 @@ export namespace SessionPrompt {
 
               if (part.mime === "application/x-directory") {
                 const args = { filePath: filepath }
-                const listCtx: Tool.Context = {
-                  sessionID: input.sessionID,
-                  abort: new AbortController().signal,
-                  agent: input.agent!,
-                  messageID: info.id,
-                  extra: { bypassCwdCheck: true },
-                  messages: [],
-                  metadata: async () => {},
-                  ask: async () => {},
-                }
-                const result = await ReadTool.init().then((t) => t.execute(args, listCtx))
+                const result = await executeSyntheticReadTool(args)
                 return [
                   {
                     messageID: info.id,

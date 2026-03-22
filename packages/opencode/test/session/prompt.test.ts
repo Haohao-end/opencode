@@ -1,7 +1,10 @@
 import path from "path"
+import fs from "fs/promises"
 import { describe, expect, test } from "bun:test"
-import { fileURLToPath } from "url"
+import { fileURLToPath, pathToFileURL } from "url"
+import { Agent } from "../../src/agent/agent"
 import { Instance } from "../../src/project/instance"
+import { Provider } from "../../src/provider/provider"
 import { ModelID, ProviderID } from "../../src/provider/schema"
 import { Session } from "../../src/session"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -10,6 +13,51 @@ import { Log } from "../../src/util/log"
 import { tmpdir } from "../fixture/fixture"
 
 Log.init({ print: false })
+
+function readHookPlugin(logFile: string, options?: { block?: boolean }) {
+  return [
+    'import fs from "fs/promises"',
+    `const logFile = ${JSON.stringify(logFile)}`,
+    "export default async () => ({",
+    '  "tool.execute.before": async (input, output) => {',
+    '    if (input.tool !== "read") return',
+    '    await fs.appendFile(logFile, JSON.stringify({ stage: "before", callID: input.callID, filePath: output.args.filePath }) + "\\n")',
+    ...(options?.block ? ['    throw new Error("blocked by plugin")'] : []),
+    "  },",
+    '  "tool.execute.after": async (input, output) => {',
+    '    if (input.tool !== "read") return',
+    '    await fs.appendFile(logFile, JSON.stringify({ stage: "after", callID: input.callID, filePath: input.args.filePath, title: output.title }) + "\\n")',
+    "  },",
+    "})",
+    "",
+  ].join("\n")
+}
+
+async function configurePluginProject(dir: string, filename: string, source: string) {
+  const pluginPath = path.join(dir, filename)
+  await Bun.write(pluginPath, source)
+  await Bun.write(
+    path.join(dir, "opencode.json"),
+    JSON.stringify({
+      $schema: "https://opencode.ai/config.json",
+      plugin: [pathToFileURL(pluginPath).href],
+      agent: {
+        build: {
+          model: "opencode/kimi-k2.5-free",
+        },
+      },
+    }),
+  )
+}
+
+async function readHookLog(logFile: string) {
+  const text = await fs.readFile(logFile, "utf8").catch(() => "")
+  return text
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+}
 
 describe("session.prompt missing file", () => {
   test("does not fail the prompt when a file part is missing", async () => {
@@ -101,6 +149,174 @@ describe("session.prompt missing file", () => {
         expect(text[0]?.startsWith("Called the Read tool with the following input:")).toBe(true)
         expect(text[1]?.includes("Read tool failed to read")).toBe(true)
         expect(text[2]).toBe("after-file")
+
+        await Session.remove(session.id)
+      },
+    })
+  })
+})
+
+describe("session.prompt tool hooks", () => {
+  test("fires read hooks for first-message @file inclusion", async () => {
+    const logFile = path.join(process.cwd(), `tmp-hook-log-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`)
+
+    await using tmp = await tmpdir({
+      git: true,
+      init: async (dir) => {
+        await Bun.write(path.join(dir, "hello.txt"), "hello from first message\n")
+        await configurePluginProject(dir, "read-hooks.ts", readHookPlugin(logFile))
+      },
+      dispose: async () => {
+        await fs.rm(logFile, { force: true })
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const session = await Session.create({})
+        const parts = await SessionPrompt.resolvePromptParts("read @hello.txt")
+        const message = await SessionPrompt.prompt({
+          sessionID: session.id,
+          agent: "build",
+          noReply: true,
+          parts,
+        })
+
+        const stored = await MessageV2.get({ sessionID: session.id, messageID: message.info.id })
+        const textParts = stored.parts.filter((part) => part.type === "text").map((part) => part.text)
+        const hookLog = await readHookLog(logFile)
+
+        expect(hookLog).toHaveLength(2)
+        expect(hookLog[0]).toEqual(
+          expect.objectContaining({
+            stage: "before",
+            filePath: path.join(tmp.path, "hello.txt"),
+          }),
+        )
+        expect(hookLog[1]).toEqual(
+          expect.objectContaining({
+            stage: "after",
+            filePath: path.join(tmp.path, "hello.txt"),
+          }),
+        )
+        expect(textParts.some((text) => text.startsWith("Called the Read tool with the following input:"))).toBe(true)
+        expect(textParts.some((text) => text.includes("hello from first message"))).toBe(true)
+
+        await Session.remove(session.id)
+      },
+    })
+  })
+
+  test("plugin before hook can block first-message @file inclusion", async () => {
+    const logFile = path.join(process.cwd(), `tmp-hook-log-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`)
+
+    await using tmp = await tmpdir({
+      git: true,
+      init: async (dir) => {
+        await Bun.write(path.join(dir, "secret.txt"), "should never be included\n")
+        await configurePluginProject(dir, "block-read.ts", readHookPlugin(logFile, { block: true }))
+      },
+      dispose: async () => {
+        await fs.rm(logFile, { force: true })
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const session = await Session.create({})
+        const parts = await SessionPrompt.resolvePromptParts("read @secret.txt")
+        const message = await SessionPrompt.prompt({
+          sessionID: session.id,
+          agent: "build",
+          noReply: true,
+          parts,
+        })
+
+        const stored = await MessageV2.get({ sessionID: session.id, messageID: message.info.id })
+        const textParts = stored.parts.filter((part) => part.type === "text").map((part) => part.text)
+        const hookLog = await readHookLog(logFile)
+
+        expect(hookLog).toHaveLength(1)
+        expect(hookLog[0]).toEqual(
+          expect.objectContaining({
+            stage: "before",
+            filePath: path.join(tmp.path, "secret.txt"),
+          }),
+        )
+        expect(textParts.some((text) => text.includes("Read tool failed to read"))).toBe(true)
+        expect(textParts.some((text) => text.includes("blocked by plugin"))).toBe(true)
+        expect(textParts.some((text) => text.includes("should never be included"))).toBe(false)
+
+        await Session.remove(session.id)
+      },
+    })
+  })
+
+  test("normal resolveTools read execution still triggers hooks", async () => {
+    const logFile = path.join(process.cwd(), `tmp-hook-log-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`)
+
+    await using tmp = await tmpdir({
+      git: true,
+      init: async (dir) => {
+        await Bun.write(path.join(dir, "normal.txt"), "normal read path\n")
+        await configurePluginProject(dir, "read-hooks.ts", readHookPlugin(logFile))
+      },
+      dispose: async () => {
+        await fs.rm(logFile, { force: true })
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const session = await Session.create({})
+        const agent = await Agent.get("build")
+        if (!agent?.model) throw new Error("expected build agent with model")
+        const model = await Provider.getModel(agent.model.providerID, agent.model.modelID)
+        const tools = await SessionPrompt.resolveTools({
+          agent,
+          model,
+          session,
+          bypassAgentCheck: false,
+          messages: [],
+          processor: {
+            message: { id: "msg_test" },
+            partFromToolCall() {
+              return undefined
+            },
+          } as any,
+        })
+
+        const read = tools.read as any
+        expect(read).toBeDefined()
+
+        const result = await read.execute(
+          { filePath: path.join(tmp.path, "normal.txt") },
+          {
+            abortSignal: new AbortController().signal,
+            toolCallId: "call-normal",
+          },
+        )
+        const hookLog = await readHookLog(logFile)
+
+        expect(result.output).toContain("normal read path")
+        expect(hookLog).toHaveLength(2)
+        expect(hookLog[0]).toEqual(
+          expect.objectContaining({
+            stage: "before",
+            callID: "call-normal",
+            filePath: path.join(tmp.path, "normal.txt"),
+          }),
+        )
+        expect(hookLog[1]).toEqual(
+          expect.objectContaining({
+            stage: "after",
+            callID: "call-normal",
+            filePath: path.join(tmp.path, "normal.txt"),
+          }),
+        )
 
         await Session.remove(session.id)
       },
